@@ -1,0 +1,39 @@
+title: "[Idea] "
+labels: ["idea"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Have an idea for `porkbun-api-skill`? Great — share it here. If you've already
+        scoped a concrete change you'd implement, you may prefer to open a feature
+        request issue instead.
+
+  - type: textarea
+    id: idea
+    attributes:
+      label: The idea
+      description: What would you like the tool to do, or do better?
+      placeholder: |
+        e.g. "It would be useful to have a `porkbun-api-skill dns import <zonefile>` command that diff-syncs a BIND-style zone file with the live records."
+    validations:
+      required: true
+
+  - type: textarea
+    id: motivation
+    attributes:
+      label: Why is this useful?
+      description: What problem does it solve, or what workflow does it speed up?
+    validations:
+      required: false
+
+  - type: textarea
+    id: safety
+    attributes:
+      label: Safety considerations
+      description: |
+        Does the proposed change touch a billable / destructive / privilege endpoint?
+        If so, what classifier tier do you think it belongs in, and why?
+      placeholder: |
+        Reference the five-tier classifier in README.md / SECURITY.md.
+    validations:
+      required: false

@@ -1,0 +1,28 @@
+# Never commit anything from the local secrets dir, even if a developer
+# accidentally moves it into the repo.
+.porkbun-api-skill/
+**/.porkbun-api-skill/
+*.token
+*.secret
+.env
+.env.*
+
+# Editor / OS noise
+.DS_Store
+.idea/
+.vscode/
+*.code-workspace
+__pycache__/
+*.pyc
+
+# Local Claude harness config (operator-installed; not for VCS).
+.claude/settings.local.json
+
+# Obsidian per-vault config — operator-local workspace, panes, plugin state.
+# The vault content under docs/ IS tracked; only the .obsidian/ config dir is not.
+docs/.obsidian/
+
+# graphify intermediates — the live code-structure graph. Auto-rebuilt by the
+# post-commit hook (installed via `graphify hook install`). Run `graphify
+# update .` once on a fresh clone to populate it. Never tracked.
+graphify-out/

@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: tests (${{ matrix.os }}, py${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python-version: ["3.8", "3.9", "3.10", "3.11", "3.12"]
+        exclude:
+          # macOS hosted runners no longer ship Python 3.8/3.9 reliably; the
+          # tool itself supports those versions on macOS, but covering them
+          # in CI on Ubuntu is sufficient.
+          - os: macos-latest
+            python-version: "3.8"
+          - os: macos-latest
+            python-version: "3.9"
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Show Python version
+        run: python --version
+
+      - name: Byte-compile the CLI
+        run: python -m py_compile bin/porkbun-api-skill
+
+      - name: Run unit tests
+        run: python -m unittest discover -v tests
+
+  shellcheck:
+    name: shellcheck install.sh
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run shellcheck
+        run: shellcheck install.sh

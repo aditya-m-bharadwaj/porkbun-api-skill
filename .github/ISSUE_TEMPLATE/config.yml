@@ -1,0 +1,14 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability (private report)
+    url: https://github.com/aditya-m-bharadwaj/porkbun-api-skill/security/advisories/new
+    about: |
+      Please DO NOT open a public issue for security vulnerabilities. File a
+      private security advisory instead. See SECURITY.md for the full policy
+      and threat model.
+  - name: Security policy and threat model
+    url: https://github.com/aditya-m-bharadwaj/porkbun-api-skill/blob/main/SECURITY.md
+    about: Read what the tool defends against, what it does not, and how to report.
+  - name: Question or discussion
+    url: https://github.com/aditya-m-bharadwaj/porkbun-api-skill/discussions
+    about: For open-ended questions, design discussion, or usage help.

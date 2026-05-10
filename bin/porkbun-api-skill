@@ -1,0 +1,48 @@
+#!/usr/bin/env python3
+"""porkbun-api-skill — safe single-file CLI for the entire Porkbun v3 API.
+
+STATUS: SCAFFOLD ONLY.
+
+The CLI itself is not yet implemented. The next development session will
+build it, following the contract in
+`.claude/skills/porkbun-api-skill/SKILL.md` and the ADRs in
+`docs/decisions/`. This stub exists so that:
+
+- the file path is committed and the install / CI pipeline doesn't break;
+- `--version` returns something useful;
+- early adopters / collaborators can see exactly what's missing.
+
+See `docs/progress/2026-05-11-scaffold.md` for the recommended pickup
+order: HTTP + credential layer first, then the classifier, then named
+commands, then the generic `api` gateway, then `gui-setup`, then tests.
+"""
+
+from __future__ import annotations
+
+import sys
+
+VERSION = "0.0.0-scaffold"
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] in ("--version", "-V"):
+        print(f"porkbun-api-skill {VERSION} (scaffold — CLI not yet implemented; "
+              f"see docs/progress/ for the build plan)")
+        return 0
+    print(
+        "porkbun-api-skill: not yet implemented.\n"
+        "\n"
+        "This repository is currently scaffolding only. The CLI is built in the\n"
+        "next development session. See:\n"
+        "  - .claude/skills/porkbun-api-skill/SKILL.md  (skill contract / classifier)\n"
+        "  - docs/decisions/                            (ADRs)\n"
+        "  - docs/progress/2026-05-11-scaffold.md       (recommended pickup)\n"
+        "  - docs/api-spec.json                         (Porkbun v3 OpenAPI spec)\n",
+        file=sys.stderr,
+    )
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

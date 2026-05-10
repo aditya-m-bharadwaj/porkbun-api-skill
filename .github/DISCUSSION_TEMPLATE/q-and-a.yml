@@ -1,0 +1,51 @@
+title: "[Q&A] "
+labels: ["question"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Asking how to do something with `porkbun-api-skill`? You're in the right place.
+
+        > **Security note:** if you've found a vulnerability (credential leak, classifier bypass,
+        > missing idempotency-key, etc.), **do not** post it here. File a private advisory at
+        > <https://github.com/aditya-m-bharadwaj/porkbun-api-skill/security/advisories/new>
+        > instead. See [SECURITY.md](https://github.com/aditya-m-bharadwaj/porkbun-api-skill/blob/main/SECURITY.md).
+
+  - type: textarea
+    id: goal
+    attributes:
+      label: What are you trying to do?
+      description: Describe the workflow or outcome, not the specific command you got stuck on.
+      placeholder: |
+        e.g. "I want to register a batch of 5 domains and add identical A records to each as part of a deploy script."
+    validations:
+      required: true
+
+  - type: textarea
+    id: tried
+    attributes:
+      label: What have you tried?
+      description: Commands you've run (use `--dry-run` where possible) and what happened.
+      render: shell
+      placeholder: |
+        $ porkbun-api-skill ...
+    validations:
+      required: false
+
+  - type: input
+    id: version
+    attributes:
+      label: porkbun-api-skill version
+      description: Output of `porkbun-api-skill --version`.
+      placeholder: "porkbun-api-skill 0.1.0-alpha.1"
+    validations:
+      required: true
+
+  - type: input
+    id: platform
+    attributes:
+      label: Platform
+      description: OS and Python version.
+      placeholder: "macOS 14.4, Python 3.12"
+    validations:
+      required: true

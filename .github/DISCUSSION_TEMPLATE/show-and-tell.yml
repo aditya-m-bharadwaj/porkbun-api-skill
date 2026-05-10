@@ -1,0 +1,37 @@
+title: "[Show & tell] "
+labels: ["show-and-tell"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Share something you built with `porkbun-api-skill` — a workflow, a wrapper script,
+        a Claude conversation that did something useful, a custom classifier extension.
+
+        Please **redact credentials and any private DNS contents** you don't want public.
+
+  - type: textarea
+    id: what
+    attributes:
+      label: What did you build?
+      description: One paragraph summary.
+    validations:
+      required: true
+
+  - type: textarea
+    id: how
+    attributes:
+      label: How does it work?
+      description: |
+        Commands, scripts, or a chat transcript (with the AI / human turns labeled).
+        Use code fences for command output.
+      render: shell
+    validations:
+      required: false
+
+  - type: input
+    id: link
+    attributes:
+      label: Link (optional)
+      description: Repo, gist, blog post, screenshot, etc.
+    validations:
+      required: false
