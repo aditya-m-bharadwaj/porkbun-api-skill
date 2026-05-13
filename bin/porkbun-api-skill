@@ -917,6 +917,52 @@ def _normalize_auto_renew(v: Any) -> str:
     return str(v)
 
 
+# DNSSEC digest length per digestType (IANA assignments):
+#   1 = SHA-1   -> 20 bytes -> 40 hex chars
+#   2 = SHA-256 -> 32 bytes -> 64 hex chars
+#   4 = SHA-384 -> 48 bytes -> 96 hex chars
+# Porkbun's API accepts any string for `digest`; this guard refuses obviously
+# wrong inputs at the CLI boundary so an operator can't ship a broken DS record
+# to the registry and break DNSSEC validation for the zone.
+_DIGEST_HEX_LEN = {"1": 40, "2": 64, "4": 96}
+_HEX_RE = re.compile(r"^[0-9A-Fa-f]+$")
+
+
+def _validate_dnssec_digest(digest: str, digest_type: str) -> None:
+    if not _HEX_RE.match(digest or ""):
+        raise CtlError(f"DNSSEC digest must be hex; got {digest!r}.")
+    expected = _DIGEST_HEX_LEN.get(str(digest_type))
+    if expected is None:
+        # digestType outside the common set; let it through but warn shape only.
+        return
+    if len(digest) != expected:
+        raise CtlError(
+            f"DNSSEC digest length mismatch: digestType={digest_type} expects "
+            f"{expected} hex chars, got {len(digest)}. "
+            "(SHA-1=40, SHA-256=64, SHA-384=96.)"
+        )
+
+
+def _parse_ip_list(ips_arg: str) -> list[str]:
+    """Parse a comma-separated list of IPv4/IPv6 addresses. Whitespace tolerant.
+    Validates each entry via stdlib `ipaddress`.
+    """
+    import ipaddress
+    out: list[str] = []
+    for raw in ips_arg.split(","):
+        s = raw.strip()
+        if not s:
+            continue
+        try:
+            ipaddress.ip_address(s)
+        except ValueError as e:
+            raise CtlError(f"Invalid IP address {s!r}: {e}") from None
+        out.append(s)
+    if not out:
+        raise CtlError("At least one IP is required.")
+    return out
+
+
 def _load_body(args: argparse.Namespace) -> Any | None:
     if getattr(args, "data", None) and getattr(args, "body", None):
         raise CtlError("--data and --body are mutually exclusive.")
@@ -1447,6 +1493,284 @@ def cmd_dns_delete(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_dns_delete_by_nametype(args: argparse.Namespace) -> int:
+    _validate_domain(args.domain)
+    if not DNS_TYPE_RE.match(args.type):
+        raise CtlError(f"Invalid DNS record type: {args.type!r}")
+    sub = args.subdomain or ""
+    _validate_subdomain_label(sub)
+    if not args.yes:
+        raise CtlError("Refusing to bulk-delete DNS records without --yes.")
+    if not args.confirm_name:
+        raise CtlError(
+            "Refusing to bulk-delete DNS records without --confirm-name <subdomain>. "
+            "deleteByNameType deletes ALL records matching (type, subdomain) — "
+            "preview with `dns list <domain>` first."
+        )
+    if args.confirm_name != sub:
+        raise CtlError(
+            f"--confirm-name mismatch: --subdomain was {sub!r}, "
+            f"--confirm-name was {args.confirm_name!r}."
+        )
+    path = f"/dns/deleteByNameType/{args.domain}/{args.type}/{sub}"
+    if args.dry_run:
+        _emit({"would_post": path}, args.json)
+        return 0
+    idem_key = uuid.uuid4().hex
+    _audit("dns-delete-by-nametype", f"{args.domain}/{args.type}/{sub}",
+           {"idempotency_key": idem_key, "classification": "destructive"})
+    resp = _request(_load_creds(), "POST", path, body={}, idempotency_key=idem_key)
+    print(f"DNS records on {args.domain} matching type={args.type} subdomain={sub!r} deleted.")
+    _emit(resp, args.json)
+    return 0
+
+
+# ---------- DNSSEC named commands -----------------------------------------
+
+
+def cmd_dnssec_list(args: argparse.Namespace) -> int:
+    _validate_domain(args.domain)
+    resp = _request(_load_creds(), "GET", f"/dns/getDnssecRecords/{args.domain}")
+    records = resp.get("records")
+    if records is None:
+        if args.json:
+            _emit({"records": []}, True)
+        else:
+            print("(no DNSSEC records)")
+        return 0
+    _emit(records, args.json)
+    return 0
+
+
+def cmd_dnssec_add(args: argparse.Namespace) -> int:
+    _validate_domain(args.domain)
+    if not args.yes:
+        raise CtlError("Refusing to add DNSSEC record without --yes.")
+    keytag = str(args.keytag)
+    alg = str(args.alg)
+    digest_type = str(args.digest_type)
+    digest = args.digest.strip()
+    _validate_dnssec_digest(digest, digest_type)
+    body: dict[str, Any] = {
+        "keyTag": keytag,
+        "alg": alg,
+        "digestType": digest_type,
+        "digest": digest,
+    }
+    if args.max_sig_life is not None:
+        body["maxSigLife"] = str(args.max_sig_life)
+    if args.dry_run:
+        _emit({"would_post": f"/dns/createDnssecRecord/{args.domain}", "body": body}, args.json)
+        return 0
+    idem_key = uuid.uuid4().hex
+    _audit("dnssec-add", args.domain,
+           {"keytag": keytag, "alg": alg, "digest_type": digest_type,
+            "idempotency_key": idem_key, "classification": "mutating",
+            "body_keys": sorted(body.keys())})
+    resp = _request(_load_creds(), "POST", f"/dns/createDnssecRecord/{args.domain}",
+                    body=body, idempotency_key=idem_key)
+    print(f"DNSSEC record added to {args.domain}: keyTag={keytag} alg={alg} digestType={digest_type}")
+    _emit(resp, args.json)
+    return 0
+
+
+def cmd_dnssec_delete(args: argparse.Namespace) -> int:
+    _validate_domain(args.domain)
+    keytag = str(args.keytag)
+    if not args.yes:
+        raise CtlError("Refusing to delete DNSSEC record without --yes.")
+    if not args.confirm_id:
+        raise CtlError("Refusing to delete DNSSEC record without --confirm-id <keytag>.")
+    if args.confirm_id != keytag:
+        raise CtlError(
+            f"--confirm-id mismatch: --keytag was {keytag!r}, "
+            f"--confirm-id was {args.confirm_id!r}."
+        )
+    path = f"/dns/deleteDnssecRecord/{args.domain}/{keytag}"
+    if args.dry_run:
+        _emit({"would_post": path}, args.json)
+        return 0
+    idem_key = uuid.uuid4().hex
+    _audit("dnssec-delete", f"{args.domain}/{keytag}",
+           {"idempotency_key": idem_key, "classification": "destructive"})
+    resp = _request(_load_creds(), "POST", path, body={}, idempotency_key=idem_key)
+    print(f"DNSSEC record keyTag={keytag} on {args.domain} deleted.")
+    _emit(resp, args.json)
+    return 0
+
+
+# ---------- Glue record named commands ------------------------------------
+# Porkbun's createGlue / updateGlue overlap: updateGlue has create-or-update
+# semantics (verified live on devbed.sbs 2026-05-13), and createGlue sometimes
+# rejects IPv4+IPv6 pairs with UPDATE_FAILED. The named `glue set` command
+# always uses updateGlue, which works for both create and update cases.
+
+
+def cmd_glue_list(args: argparse.Namespace) -> int:
+    _validate_domain(args.domain)
+    resp = _request(_load_creds(), "GET", f"/domain/getGlue/{args.domain}")
+    hosts = resp.get("hosts")
+    if hosts is None or hosts == []:
+        if args.json:
+            _emit({"hosts": []}, True)
+        else:
+            print("(no glue records)")
+        return 0
+    if args.json:
+        _emit(hosts, True)
+    else:
+        for entry in hosts:
+            if isinstance(entry, list) and len(entry) >= 2:
+                host, payload = entry[0], entry[1]
+                v4 = (payload or {}).get("v4", [])
+                v6 = (payload or {}).get("v6", [])
+                ips = ", ".join(list(v4) + list(v6))
+                print(f"{host}  ips=[{ips}]")
+            else:
+                print(json.dumps(entry, default=str))
+    return 0
+
+
+def cmd_glue_set(args: argparse.Namespace) -> int:
+    _validate_domain(args.domain)
+    sub = args.subdomain
+    if not sub or "." in sub:
+        raise CtlError(
+            "--subdomain must be a single host label (e.g. 'ns1'), not a full FQDN."
+        )
+    _validate_subdomain_label(sub)
+    if not args.yes:
+        raise CtlError("Refusing to create/update glue record without --yes.")
+    ips = _parse_ip_list(args.ip)
+    body = {"ips": ips}
+    # Always use updateGlue: it's create-or-update on Porkbun's side, and avoids
+    # the IPv4+IPv6 UPDATE_FAILED quirk that affects /domain/createGlue.
+    path = f"/domain/updateGlue/{args.domain}/{sub}"
+    if args.dry_run:
+        _emit({"would_post": path, "body": body, "note": "uses updateGlue for create-or-update"}, args.json)
+        return 0
+    idem_key = uuid.uuid4().hex
+    _audit("glue-set", f"{args.domain}/{sub}",
+           {"ips": ips, "idempotency_key": idem_key, "classification": "mutating",
+            "body_keys": ["ips"]})
+    resp = _request(_load_creds(), "POST", path, body=body, idempotency_key=idem_key)
+    print(f"Glue record {sub}.{args.domain} set to ips={ips}.")
+    _emit(resp, args.json)
+    return 0
+
+
+def cmd_glue_delete(args: argparse.Namespace) -> int:
+    _validate_domain(args.domain)
+    sub = args.subdomain
+    if not sub or "." in sub:
+        raise CtlError(
+            "--subdomain must be a single host label (e.g. 'ns1'), not a full FQDN."
+        )
+    _validate_subdomain_label(sub)
+    if not args.yes:
+        raise CtlError("Refusing to delete glue record without --yes.")
+    if not args.confirm_name:
+        raise CtlError("Refusing to delete glue record without --confirm-name <subdomain>.")
+    if args.confirm_name != sub:
+        raise CtlError(
+            f"--confirm-name mismatch: --subdomain was {sub!r}, "
+            f"--confirm-name was {args.confirm_name!r}."
+        )
+    path = f"/domain/deleteGlue/{args.domain}/{sub}"
+    if args.dry_run:
+        _emit({"would_post": path}, args.json)
+        return 0
+    idem_key = uuid.uuid4().hex
+    _audit("glue-delete", f"{args.domain}/{sub}",
+           {"idempotency_key": idem_key, "classification": "destructive"})
+    resp = _request(_load_creds(), "POST", path, body={}, idempotency_key=idem_key)
+    print(f"Glue record {sub}.{args.domain} deleted.")
+    _emit(resp, args.json)
+    return 0
+
+
+# ---------- URL-forwarding named commands ---------------------------------
+
+
+def cmd_forward_list(args: argparse.Namespace) -> int:
+    _validate_domain(args.domain)
+    resp = _request(_load_creds(), "GET", f"/domain/getUrlForwarding/{args.domain}")
+    forwards = resp.get("forwards")
+    if not forwards:
+        if args.json:
+            _emit({"forwards": []}, True)
+        else:
+            print("(no URL forwards)")
+        return 0
+    if args.json:
+        _emit(forwards, True)
+    else:
+        for f in forwards:
+            sub = f.get("subdomain") or "(root)"
+            print(f"#{f.get('id'):<10} {sub:<24} -> {f.get('location')}  "
+                  f"type={f.get('type')} includePath={f.get('includePath')} "
+                  f"wildcard={f.get('wildcard')}")
+    return 0
+
+
+def cmd_forward_add(args: argparse.Namespace) -> int:
+    _validate_domain(args.domain)
+    if not args.yes:
+        raise CtlError("Refusing to add URL forward without --yes.")
+    if args.permanent and args.temporary:
+        raise CtlError("--permanent and --temporary are mutually exclusive.")
+    if not (args.permanent or args.temporary):
+        raise CtlError("Pass --permanent (HTTP 301) or --temporary (configured default redirect).")
+    sub = args.subdomain or ""
+    if sub:
+        _validate_subdomain_label(sub)
+    body: dict[str, Any] = {
+        "subdomain": sub,
+        "location": args.location,
+        "type": "permanent" if args.permanent else "temporary",
+        "includePath": "yes" if args.include_path else "no",
+        "wildcard": "yes" if args.wildcard else "no",
+    }
+    if args.dry_run:
+        _emit({"would_post": f"/domain/addUrlForward/{args.domain}", "body": body}, args.json)
+        return 0
+    idem_key = uuid.uuid4().hex
+    _audit("forward-add", args.domain,
+           {"subdomain": sub, "type": body["type"],
+            "idempotency_key": idem_key, "classification": "mutating",
+            "body_keys": sorted(body.keys())})
+    resp = _request(_load_creds(), "POST", f"/domain/addUrlForward/{args.domain}",
+                    body=body, idempotency_key=idem_key)
+    print(f"URL forward added on {args.domain}: {sub or '(root)'} -> {args.location} ({body['type']})")
+    _emit(resp, args.json)
+    return 0
+
+
+def cmd_forward_delete(args: argparse.Namespace) -> int:
+    _validate_domain(args.domain)
+    if not RECORD_ID_RE.match(args.id):
+        raise CtlError(f"Invalid forward id (must be numeric): {args.id!r}")
+    if not args.yes:
+        raise CtlError("Refusing to delete URL forward without --yes.")
+    if not args.confirm_id:
+        raise CtlError("Refusing to delete URL forward without --confirm-id <id>.")
+    if args.confirm_id != args.id:
+        raise CtlError(
+            f"--confirm-id mismatch: --id was {args.id!r}, --confirm-id was {args.confirm_id!r}."
+        )
+    path = f"/domain/deleteUrlForward/{args.domain}/{args.id}"
+    if args.dry_run:
+        _emit({"would_post": path}, args.json)
+        return 0
+    idem_key = uuid.uuid4().hex
+    _audit("forward-delete", f"{args.domain}/{args.id}",
+           {"idempotency_key": idem_key, "classification": "destructive"})
+    resp = _request(_load_creds(), "POST", path, body={}, idempotency_key=idem_key)
+    print(f"URL forward {args.id} on {args.domain} deleted.")
+    _emit(resp, args.json)
+    return 0
+
+
 def cmd_ssl(args: argparse.Namespace) -> int:
     _validate_domain(args.domain)
     if not args.yes:
@@ -1798,6 +2122,117 @@ def build_parser() -> argparse.ArgumentParser:
     p_dd.add_argument("--confirm-id", required=False, help="Must equal --id.")
     _add_mut(p_dd)
     p_dd.set_defaults(func=cmd_dns_delete)
+
+    p_ddbn = p_dns_sub.add_parser(
+        "delete-by-nametype", parents=[common],
+        help="Bulk-delete ALL records matching (type, subdomain). Destructive.",
+    )
+    p_ddbn.add_argument("domain")
+    p_ddbn.add_argument("--type", required=True)
+    p_ddbn.add_argument("--subdomain", default="",
+                        help="Subdomain part only (no domain). Blank for root.")
+    p_ddbn.add_argument("--confirm-name", required=False,
+                        help="Must equal --subdomain.")
+    _add_mut(p_ddbn)
+    p_ddbn.set_defaults(func=cmd_dns_delete_by_nametype)
+
+    # ---- DNSSEC
+    p_sec = sub.add_parser("dnssec", parents=[common], help="DNSSEC (DS record) operations.")
+    p_sec_sub = p_sec.add_subparsers(dest="dnssec_cmd", required=True)
+
+    p_sec_list = p_sec_sub.add_parser("list", parents=[common],
+                                       help="List DNSSEC records on the domain.")
+    p_sec_list.add_argument("domain")
+    p_sec_list.set_defaults(func=cmd_dnssec_list)
+
+    p_sec_add = p_sec_sub.add_parser(
+        "add", parents=[common],
+        help="Create a DNSSEC (DS) record. Digest format is validated client-side.",
+    )
+    p_sec_add.add_argument("domain")
+    p_sec_add.add_argument("--keytag", required=True,
+                           help="DNSSEC key tag (matches the DNSKEY in the zone).")
+    p_sec_add.add_argument("--alg", required=True,
+                           help="DS algorithm number (e.g. 13 = ECDSA P-256 SHA-256).")
+    p_sec_add.add_argument("--digest-type", required=True,
+                           help="Digest type number (1=SHA-1, 2=SHA-256, 4=SHA-384).")
+    p_sec_add.add_argument("--digest", required=True,
+                           help="Hex-encoded digest. SHA-1=40 chars, SHA-256=64, SHA-384=96.")
+    p_sec_add.add_argument("--max-sig-life", type=int,
+                           help="Maximum signature lifetime in seconds (registry-specific).")
+    _add_mut(p_sec_add)
+    p_sec_add.set_defaults(func=cmd_dnssec_add)
+
+    p_sec_del = p_sec_sub.add_parser("delete", parents=[common],
+                                      help="Delete a DNSSEC record by keytag. Destructive.")
+    p_sec_del.add_argument("domain")
+    p_sec_del.add_argument("--keytag", required=True)
+    p_sec_del.add_argument("--confirm-id", required=False, help="Must equal --keytag.")
+    _add_mut(p_sec_del)
+    p_sec_del.set_defaults(func=cmd_dnssec_delete)
+
+    # ---- Glue records (vanity nameservers for THIS domain)
+    p_glue = sub.add_parser("glue", parents=[common], help="Glue record operations (vanity NSes for this domain).")
+    p_glue_sub = p_glue.add_subparsers(dest="glue_cmd", required=True)
+
+    p_glue_list = p_glue_sub.add_parser("list", parents=[common],
+                                         help="List glue records on the domain.")
+    p_glue_list.add_argument("domain")
+    p_glue_list.set_defaults(func=cmd_glue_list)
+
+    p_glue_set = p_glue_sub.add_parser(
+        "set", parents=[common],
+        help="Create or update a glue record. Uses updateGlue (create-or-update); "
+             "avoids the IPv4+IPv6 UPDATE_FAILED quirk of /domain/createGlue.",
+    )
+    p_glue_set.add_argument("domain")
+    p_glue_set.add_argument("--subdomain", required=True,
+                            help="Single host label (e.g. 'ns1'), not a full FQDN.")
+    p_glue_set.add_argument("--ip", required=True,
+                            help="Comma-separated IPv4/IPv6 addresses.")
+    _add_mut(p_glue_set)
+    p_glue_set.set_defaults(func=cmd_glue_set)
+
+    p_glue_del = p_glue_sub.add_parser("delete", parents=[common],
+                                        help="Delete a glue record by subdomain. Destructive.")
+    p_glue_del.add_argument("domain")
+    p_glue_del.add_argument("--subdomain", required=True)
+    p_glue_del.add_argument("--confirm-name", required=False, help="Must equal --subdomain.")
+    _add_mut(p_glue_del)
+    p_glue_del.set_defaults(func=cmd_glue_delete)
+
+    # ---- URL forwarding
+    p_fwd = sub.add_parser("forward", parents=[common], help="URL forwarding operations.")
+    p_fwd_sub = p_fwd.add_subparsers(dest="forward_cmd", required=True)
+
+    p_fwd_list = p_fwd_sub.add_parser("list", parents=[common],
+                                       help="List URL forwards on the domain.")
+    p_fwd_list.add_argument("domain")
+    p_fwd_list.set_defaults(func=cmd_forward_list)
+
+    p_fwd_add = p_fwd_sub.add_parser("add", parents=[common], help="Create a URL forward.")
+    p_fwd_add.add_argument("domain")
+    p_fwd_add.add_argument("--location", required=True,
+                           help="Destination URL (e.g. https://destination.example.com/).")
+    p_fwd_add.add_argument("--subdomain", default="",
+                           help="Subdomain to forward (blank for root).")
+    p_fwd_add.add_argument("--permanent", action="store_true", help="HTTP 301.")
+    p_fwd_add.add_argument("--temporary", action="store_true",
+                           help="Configured default redirect (typically HTTP 302).")
+    p_fwd_add.add_argument("--include-path", action="store_true",
+                           help="Append the request URI path to the destination.")
+    p_fwd_add.add_argument("--wildcard", action="store_true",
+                           help="Forward all subdomains of the forwarded subdomain too.")
+    _add_mut(p_fwd_add)
+    p_fwd_add.set_defaults(func=cmd_forward_add)
+
+    p_fwd_del = p_fwd_sub.add_parser("delete", parents=[common],
+                                      help="Delete a URL forward by id. Destructive.")
+    p_fwd_del.add_argument("domain")
+    p_fwd_del.add_argument("--id", required=True)
+    p_fwd_del.add_argument("--confirm-id", required=False, help="Must equal --id.")
+    _add_mut(p_fwd_del)
+    p_fwd_del.set_defaults(func=cmd_forward_delete)
 
     # ---- SSL
     p_ssl = sub.add_parser("ssl", parents=[common],

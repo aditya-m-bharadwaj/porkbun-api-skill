@@ -65,6 +65,16 @@ Default fallbacks if an endpoint isn't in the classifier table: GET → read, PO
 | `porkbun-api-skill dns add <name> --type A --content 1.2.3.4 [--subdomain s] [--ttl 600] --yes` | Create record (`/dns/create/{domain}`) | Mutating |
 | `porkbun-api-skill dns edit <name> --id <id> --content ... --yes --confirm-id <id>` | Edit record (`/dns/edit/{domain}/{id}`) | Destructive-ish; treats edits as destructive when overwriting `A`/`AAAA`/`MX`/`NS`. |
 | `porkbun-api-skill dns delete <name> --id <id> --yes --confirm-id <id>` | Delete record (`/dns/delete/{domain}/{id}`) | Destructive |
+| `porkbun-api-skill dns delete-by-nametype <name> --type T --subdomain s --confirm-name s --yes` | Bulk-delete all records matching `(type, subdomain)` (`/dns/deleteByNameType/...`) | **Destructive** — deletes multiple. Preview with `dns list` first. |
+| `porkbun-api-skill dnssec list <name>` | List DNSSEC records (`/dns/getDnssecRecords/{domain}`) | Read |
+| `porkbun-api-skill dnssec add <name> --keytag N --alg N --digest-type N --digest HEX --yes` | Add a DS record. CLI validates digest hex + length (SHA-1=40, SHA-256=64, SHA-384=96). | Mutating |
+| `porkbun-api-skill dnssec delete <name> --keytag N --confirm-id N --yes` | Delete DS record (`/dns/deleteDnssecRecord/{domain}/{keytag}`) | Destructive |
+| `porkbun-api-skill glue list <name>` | List glue records (`/domain/getGlue/{domain}`) | Read |
+| `porkbun-api-skill glue set <name> --subdomain ns1 --ip 1.2.3.4[,2001:db8::1] --yes` | Create-or-update a glue host. Uses `updateGlue` (which has create-or-update semantics) and so avoids the `createGlue` IPv4+IPv6 `UPDATE_FAILED` quirk. | Mutating |
+| `porkbun-api-skill glue delete <name> --subdomain ns1 --confirm-name ns1 --yes` | Delete glue (`/domain/deleteGlue/{domain}/{subdomain}`) | Destructive |
+| `porkbun-api-skill forward list <name>` | List URL forwards (`/domain/getUrlForwarding/{domain}`) | Read |
+| `porkbun-api-skill forward add <name> --location https://x/ --subdomain fwd --permanent --yes` | Create a URL forward. Exactly one of `--permanent` (HTTP 301) / `--temporary` is required. | Mutating |
+| `porkbun-api-skill forward delete <name> --id N --confirm-id N --yes` | Delete URL forward (`/domain/deleteUrlForward/{domain}/{id}`) | Destructive |
 | `porkbun-api-skill ssl <name>` | Retrieve SSL bundle (`/ssl/retrieve/{domain}`) | **Privilege** — response contains private key material; write to a file with mode 0600 and tell the user the path. Do **not** echo to chat. |
 | `porkbun-api-skill audit-log [--last N]` | Local mutation log | |
 | `porkbun-api-skill classify <METHOD> <path>` | Plan-time helper | |

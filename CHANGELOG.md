@@ -4,6 +4,35 @@ All notable changes are documented here. Format follows [Keep a Changelog](https
 
 ## [Unreleased]
 
+### Added — named commands for the remaining endpoint families (DNSSEC / glue / URL forwarding / `dns delete-by-nametype`)
+
+Previously these required reaching for the generic `porkbun-api-skill api <METHOD> <path>` form. The new named wrappers add per-endpoint validation that the generic form can't provide (digest hex+length, IP-list parsing, single-label subdomain enforcement, redirect-type mutual exclusion) and keep the audit log entries readable (`dnssec-add` instead of `api:post`).
+
+- **`dns delete-by-nametype <domain> --type T --subdomain S --confirm-name S --yes`** — bulk-deletes ALL records matching `(type, subdomain)` via `POST /dns/deleteByNameType/{domain}/{type}/{subdomain}`. Destructive tier; refuses without `--confirm-name` matching `--subdomain`.
+- **`dnssec list <domain>`** — `GET /dns/getDnssecRecords/{domain}`. Read.
+- **`dnssec add <domain> --keytag N --alg N --digest-type N --digest HEX --yes`** — `POST /dns/createDnssecRecord/{domain}`. Mutating. Client-side validation refuses non-hex digests and length mismatches: SHA-1 (digestType 1) requires 40 hex chars, SHA-256 (2) requires 64, SHA-384 (4) requires 96. Operators can't ship broken DS records to the registry through the CLI anymore.
+- **`dnssec delete <domain> --keytag N --confirm-id N --yes`** — `POST /dns/deleteDnssecRecord/{domain}/{keytag}`. Destructive.
+- **`glue list <domain>`** — `GET /domain/getGlue/{domain}`. Read; pretty-prints `host  ips=[...]`.
+- **`glue set <domain> --subdomain S --ip IP[,IP,...] --yes`** — create-or-update a glue record. Uses `POST /domain/updateGlue/{domain}/{subdomain}` (which has create-or-update semantics, verified live on 2026-05-13) — bypasses the IPv4+IPv6 `UPDATE_FAILED` quirk of `/domain/createGlue`. `--ip` accepts comma-separated IPv4 and IPv6 (validated via stdlib `ipaddress`). Single-label `--subdomain` enforced (refuses full FQDNs).
+- **`glue delete <domain> --subdomain S --confirm-name S --yes`** — `POST /domain/deleteGlue/{domain}/{subdomain}`. Destructive.
+- **`forward list <domain>`** — `GET /domain/getUrlForwarding/{domain}`. Read; pretty-prints `#id  sub -> location  type=... includePath=... wildcard=...`.
+- **`forward add <domain> --location URL --subdomain S [--permanent|--temporary] [--include-path] [--wildcard] --yes`** — `POST /domain/addUrlForward/{domain}`. Mutating. `--permanent` (HTTP 301) and `--temporary` are mutually exclusive and exactly one is required.
+- **`forward delete <domain> --id N --confirm-id N --yes`** — `POST /domain/deleteUrlForward/{domain}/{id}`. Destructive.
+
+New helpers (visible in tests): `_validate_dnssec_digest(digest, digest_type)` and `_parse_ip_list(s)`.
+
+### Live findings from this session (2026-05-13)
+
+- `dnssec` named commands smoked end-to-end on `idwgit.cc` (add → list → delete). Same cycle on `devbed.sbs` triggered Porkbun-side `500 Internal Server Error` on `GET/POST /dns/getDnssecRecords/devbed.sbs` after the morning's create+delete cycle on that same domain — appears to be a Porkbun stale-state bug specific to this domain. Not a CLI issue; `idwgit.cc` is fine.
+- `glue set` reproduced the IPv4+IPv6 `UPDATE_FAILED` quirk on `/domain/createGlue` via direct `updateGlue` first try; the documented workaround in `glue set --help` (always use updateGlue) holds — second `glue set` call with IPv4-only succeeded as create-or-update.
+
+### Tests
+
+`tests/test_classify.py`: 68 → 91 tests, all passing.
+- `TestDnssecDigestValidator` (8 cases): SHA-1/256/384 length checks, hex-only enforcement, unknown digestType fall-through, empty-digest rejection.
+- `TestParseIpList` (5 cases): IPv4, IPv6, mixed, invalid IP rejection, empty rejection.
+- `TestNewCommandConfirmGuards` (10 cases): every new destructive named command refuses missing/mismatched `--confirm-id` / `--confirm-name` before reaching `_load_creds`. Also covers `glue set` refusing FQDN-style subdomains, `forward add` refusing no/both redirect-type flags.
+
 ### Fixed / Polished — post-alpha.1 papercuts (from 2026-05-13 live test on idwgit.cc)
 
 - **`--json` works after a subcommand.** Previously `--json` was only defined on the top-level parser, so `porkbun-api-skill dns list <domain> --json` silently emitted human-readable output (and broke a downstream `python3 -c` pipe during the live test). The flag is now declared on a parent parser (`_global_parent()`) and inherited by every subparser via `parents=[common]`. Both positions work: `--json <subcmd>` and `<subcmd> ... --json`.

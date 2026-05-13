@@ -385,6 +385,161 @@ class TestFormatSummaryPrio(unittest.TestCase):
         self.assertNotIn("prio=", s)
 
 
+class TestDnssecDigestValidator(unittest.TestCase):
+    """`_validate_dnssec_digest` refuses non-hex inputs and length mismatches
+    so an operator can't ship a broken DS record to the registry.
+    """
+
+    def test_sha1_correct_length_accepted(self):
+        pb._validate_dnssec_digest("A" * 40, "1")  # SHA-1 = 40 hex chars
+
+    def test_sha256_correct_length_accepted(self):
+        pb._validate_dnssec_digest("A" * 64, "2")  # SHA-256 = 64 hex chars
+
+    def test_sha384_correct_length_accepted(self):
+        pb._validate_dnssec_digest("A" * 96, "4")  # SHA-384 = 96 hex chars
+
+    def test_lowercase_hex_accepted(self):
+        pb._validate_dnssec_digest("abcdef0123456789" * 4, "2")
+
+    def test_non_hex_rejected(self):
+        with self.assertRaises(pb.CtlError):
+            pb._validate_dnssec_digest("ZZZ" * 22, "2")  # 66 chars but contains Z
+
+    def test_wrong_length_rejected(self):
+        with self.assertRaises(pb.CtlError):
+            pb._validate_dnssec_digest("A" * 40, "2")  # SHA-256 needs 64 not 40
+
+    def test_unknown_digest_type_falls_through(self):
+        # Unknown digestType: hex-format check still applies, length is not enforced.
+        pb._validate_dnssec_digest("A" * 50, "99")
+        with self.assertRaises(pb.CtlError):
+            pb._validate_dnssec_digest("not-hex", "99")
+
+    def test_empty_digest_rejected(self):
+        with self.assertRaises(pb.CtlError):
+            pb._validate_dnssec_digest("", "2")
+
+
+class TestParseIpList(unittest.TestCase):
+    """`_parse_ip_list` accepts IPv4 and IPv6, comma-separated, whitespace tolerant."""
+
+    def test_single_ipv4(self):
+        self.assertEqual(pb._parse_ip_list("192.0.2.1"), ["192.0.2.1"])
+
+    def test_single_ipv6(self):
+        self.assertEqual(pb._parse_ip_list("2001:db8::1"), ["2001:db8::1"])
+
+    def test_mixed_v4_v6(self):
+        self.assertEqual(
+            pb._parse_ip_list("192.0.2.1, 2001:db8::1"),
+            ["192.0.2.1", "2001:db8::1"],
+        )
+
+    def test_invalid_ip_rejected(self):
+        with self.assertRaises(pb.CtlError):
+            pb._parse_ip_list("not-an-ip")
+        with self.assertRaises(pb.CtlError):
+            pb._parse_ip_list("999.999.999.999")
+
+    def test_empty_rejected(self):
+        with self.assertRaises(pb.CtlError):
+            pb._parse_ip_list("")
+        with self.assertRaises(pb.CtlError):
+            pb._parse_ip_list(", , ")
+
+
+class TestNewCommandConfirmGuards(unittest.TestCase):
+    """Verify the new destructive named commands enforce --confirm-* matching
+    before any network call. All run without creds (gate fires first).
+    """
+
+    def test_dns_delete_by_nametype_refuses_without_confirm_name(self):
+        # Refused at the parser/validator stage — no creds required.
+        ret = pb.main([
+            "dns", "delete-by-nametype", "example.com",
+            "--type", "TXT", "--subdomain", "foo", "--yes",
+        ])
+        self.assertEqual(ret, 2)
+
+    def test_dns_delete_by_nametype_refuses_mismatched_confirm_name(self):
+        ret = pb.main([
+            "dns", "delete-by-nametype", "example.com",
+            "--type", "TXT", "--subdomain", "foo",
+            "--confirm-name", "bar", "--yes",
+        ])
+        self.assertEqual(ret, 2)
+
+    def test_dnssec_add_refuses_bad_digest(self):
+        # Wrong length for digestType=2 (SHA-256 needs 64 hex chars).
+        ret = pb.main([
+            "dnssec", "add", "example.com",
+            "--keytag", "12345", "--alg", "13",
+            "--digest-type", "2", "--digest", "AAAA",
+            "--yes",
+        ])
+        self.assertEqual(ret, 2)
+
+    def test_dnssec_delete_refuses_mismatched_confirm_id(self):
+        ret = pb.main([
+            "dnssec", "delete", "example.com",
+            "--keytag", "12345", "--confirm-id", "99999",
+            "--yes",
+        ])
+        self.assertEqual(ret, 2)
+
+    def test_glue_set_refuses_fqdn_subdomain(self):
+        # --subdomain must be a single label, not a full hostname.
+        ret = pb.main([
+            "glue", "set", "example.com",
+            "--subdomain", "ns1.example.com",
+            "--ip", "192.0.2.1", "--yes",
+        ])
+        self.assertEqual(ret, 2)
+
+    def test_glue_set_refuses_invalid_ip(self):
+        ret = pb.main([
+            "glue", "set", "example.com",
+            "--subdomain", "ns1",
+            "--ip", "not-an-ip", "--yes",
+        ])
+        self.assertEqual(ret, 2)
+
+    def test_glue_delete_refuses_mismatched_confirm_name(self):
+        ret = pb.main([
+            "glue", "delete", "example.com",
+            "--subdomain", "ns1", "--confirm-name", "ns2",
+            "--yes",
+        ])
+        self.assertEqual(ret, 2)
+
+    def test_forward_add_refuses_no_redirect_type(self):
+        # Must specify --permanent or --temporary.
+        ret = pb.main([
+            "forward", "add", "example.com",
+            "--location", "https://target.example/",
+            "--subdomain", "fwd", "--yes",
+        ])
+        self.assertEqual(ret, 2)
+
+    def test_forward_add_refuses_both_redirect_types(self):
+        ret = pb.main([
+            "forward", "add", "example.com",
+            "--location", "https://target.example/",
+            "--subdomain", "fwd",
+            "--permanent", "--temporary", "--yes",
+        ])
+        self.assertEqual(ret, 2)
+
+    def test_forward_delete_refuses_mismatched_confirm_id(self):
+        ret = pb.main([
+            "forward", "delete", "example.com",
+            "--id", "12345", "--confirm-id", "99999",
+            "--yes",
+        ])
+        self.assertEqual(ret, 2)
+
+
 class TestPrioRejection(unittest.TestCase):
     """`dns add` and `dns edit` refuse `--prio` for non-MX/SRV record types.
     The check runs before any credential load or network call.
