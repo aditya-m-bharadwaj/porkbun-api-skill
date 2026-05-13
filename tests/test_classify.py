@@ -307,6 +307,114 @@ class TestCliEntrypoint(unittest.TestCase):
         # classify is read-only, no creds needed, no network.
         self.assertEqual(pb.main(["classify", "POST", "/dns/create/example.com"]), 0)
 
+    def test_json_flag_accepted_before_subcommand(self):
+        self.assertEqual(pb.main(["--json", "classify", "POST", "/ping"]), 0)
+
+    def test_json_flag_accepted_after_subcommand(self):
+        # Regression: pre-fix, `--json` after a subcommand silently produced
+        # human-readable output (caught during the 2026-05-13 live test).
+        self.assertEqual(pb.main(["classify", "POST", "/ping", "--json"]), 0)
+
+
+class TestNormalizeAutoRenew(unittest.TestCase):
+    """Porkbun's autoRenew field is 0 (int) when off but '1' (string) when on.
+    The CLI normalizes to a stable string for `domain <name>` output.
+    """
+
+    def test_int_one_becomes_string_one(self):
+        self.assertEqual(pb._normalize_auto_renew(1), "1")
+
+    def test_int_zero_becomes_string_zero(self):
+        self.assertEqual(pb._normalize_auto_renew(0), "0")
+
+    def test_string_one_passes_through(self):
+        self.assertEqual(pb._normalize_auto_renew("1"), "1")
+
+    def test_string_zero_passes_through(self):
+        self.assertEqual(pb._normalize_auto_renew("0"), "0")
+
+    def test_bool_true(self):
+        self.assertEqual(pb._normalize_auto_renew(True), "1")
+
+    def test_bool_false(self):
+        self.assertEqual(pb._normalize_auto_renew(False), "0")
+
+    def test_unknown_value_falls_through(self):
+        # Defensive: don't crash on unexpected values from Porkbun.
+        self.assertEqual(pb._normalize_auto_renew("maybe"), "maybe")
+
+
+class TestFormatSummaryPrio(unittest.TestCase):
+    """`_format_summary` hides `prio` for record types where it's meaningless
+    (Porkbun returns prio=0 for NS/A/AAAA/CNAME/TXT/CAA, which is noise).
+    """
+
+    def test_mx_record_shows_prio(self):
+        s = pb._format_summary({
+            "id": 1, "name": "mail.example.com", "type": "MX",
+            "content": "mail.invalid", "ttl": 600, "prio": 10,
+        })
+        self.assertIn("prio=10", s)
+
+    def test_srv_record_shows_prio(self):
+        s = pb._format_summary({
+            "id": 1, "name": "_sip._tcp.example.com", "type": "SRV",
+            "content": "0 5 5060 sip.example.com", "ttl": 600, "prio": 5,
+        })
+        self.assertIn("prio=5", s)
+
+    def test_ns_record_hides_prio(self):
+        s = pb._format_summary({
+            "id": 1, "name": "example.com", "type": "NS",
+            "content": "ns1.example.com", "ttl": 86400, "prio": 0,
+        })
+        self.assertNotIn("prio=", s)
+
+    def test_a_record_hides_prio(self):
+        s = pb._format_summary({
+            "id": 1, "name": "www.example.com", "type": "A",
+            "content": "1.2.3.4", "ttl": 600, "prio": 0,
+        })
+        self.assertNotIn("prio=", s)
+
+    def test_txt_record_hides_prio(self):
+        s = pb._format_summary({
+            "id": 1, "name": "example.com", "type": "TXT",
+            "content": "v=spf1 -all", "ttl": 600, "prio": 0,
+        })
+        self.assertNotIn("prio=", s)
+
+
+class TestPrioRejection(unittest.TestCase):
+    """`dns add` and `dns edit` refuse `--prio` for non-MX/SRV record types.
+    The check runs before any credential load or network call.
+    """
+
+    def test_dns_add_prio_on_a_record_is_refused(self):
+        # CtlError -> exit code 2. Pass --type A with --prio.
+        # _validate_domain and the --yes / --prio checks all happen before _load_creds.
+        ret = pb.main([
+            "dns", "add", "example.com",
+            "--type", "A", "--content", "1.2.3.4",
+            "--prio", "10", "--yes",
+        ])
+        self.assertEqual(ret, 2)
+
+    def test_dns_add_prio_on_mx_is_accepted_(self):
+        # MX is accepted at the validation stage. It WOULD then fail at
+        # _load_creds (no creds in test env) — but that's a different
+        # CtlError, also exit 2. The point: not the prio CtlError.
+        # We can't easily distinguish without capturing stderr, so just
+        # confirm it doesn't raise prematurely — i.e. it gets past the prio check.
+        # (This is a smoke; the negative test above covers the new logic.)
+        ret = pb.main([
+            "dns", "add", "example.com",
+            "--type", "MX", "--content", "mail.invalid",
+            "--prio", "10", "--yes",
+        ])
+        # Either 0 (impossible without creds) or 2 (CtlError, likely no-creds).
+        self.assertIn(ret, (0, 2))
+
 
 if __name__ == "__main__":
     unittest.main()

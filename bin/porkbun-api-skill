@@ -618,9 +618,17 @@ def _request(
         try:
             body_text = e.read().decode("utf-8")
             parsed = json.loads(body_text)
-            # Porkbun error shape: {"status":"ERROR","message":"..."}.
+            # Porkbun error shape: {"status":"ERROR","message":"...","code":"..."}.
             msg = parsed.get("message") or parsed.get("error") or ""
             code = parsed.get("code") or ""
+            # Friendlier path for the "domain isn't opted in to API access" gate.
+            haystack = f"{code} {msg}".upper()
+            if "API_ACCESS_DISABLED" in haystack or "NOT_OPTED_IN_TO_API_ACCESS" in haystack:
+                raise CtlError(
+                    "This domain isn't opted in to Porkbun's API access. "
+                    "Enable it at https://porkbun.com/account/api (account-wide toggle) "
+                    "or in the domain's per-domain settings page, then retry."
+                ) from None
             if msg:
                 if code:
                     raise CtlError(f"Porkbun API {e.code} {code}: {msg}") from None
@@ -878,16 +886,35 @@ def _emit(obj: Any, json_mode: bool) -> None:
         print(obj)
 
 
+_PRIO_RECORD_TYPES = ("MX", "SRV")
+
+
 def _format_summary(x: Any) -> str:
     if isinstance(x, dict):
         if "domain" in x and "status" in x:
             exp = x.get("expireDate") or x.get("expire_date") or "?"
-            return f"{x.get('domain',''):<32}  status={x.get('status','?'):<10}  expires={exp}  autorenew={x.get('autoRenew', x.get('autorenew','?'))}"
+            autorenew = _normalize_auto_renew(x.get("autoRenew", x.get("autorenew", "?")))
+            return f"{x.get('domain',''):<32}  status={x.get('status','?'):<10}  expires={exp}  autorenew={autorenew}"
         if "id" in x and "type" in x and "content" in x:
             name = x.get("name") or "(root)"
-            return f"#{x['id']:<12} {name:<24} type={x.get('type','?'):<6} content={x.get('content','?')}  ttl={x.get('ttl','?')}  prio={x.get('prio','?')}"
+            rtype = x.get("type", "?")
+            # Only show prio for record types where it's meaningful (MX, SRV).
+            # Porkbun returns prio=0 for other types, which is noise.
+            prio_part = f"  prio={x.get('prio', '?')}" if rtype in _PRIO_RECORD_TYPES else ""
+            return f"#{x['id']:<12} {name:<24} type={rtype:<6} content={x.get('content','?')}  ttl={x.get('ttl','?')}{prio_part}"
         return json.dumps(x, default=str)
     return str(x)
+
+
+def _normalize_auto_renew(v: Any) -> str:
+    """Normalize Porkbun's autoRenew field (returns 0 int when off, '1' string when on)
+    to a stable string '0' or '1' so downstream consumers don't have to special-case.
+    """
+    if v is True or str(v) in ("1", "true", "yes", "on"):
+        return "1"
+    if v is False or str(v) in ("0", "false", "no", "off"):
+        return "0"
+    return str(v)
 
 
 def _load_body(args: argparse.Namespace) -> Any | None:
@@ -1089,6 +1116,12 @@ def cmd_domain(args: argparse.Namespace) -> int:
     creds = _load_creds()
     _validate_domain(args.domain)
     resp = _request(creds, "GET", f"/domain/get/{args.domain}")
+    # Normalize Porkbun's inconsistent autoRenew typing (0 int when off, "1" string when on)
+    # to a stable string "0"/"1" so consumers don't have to special-case both forms.
+    if isinstance(resp, dict) and isinstance(resp.get("domain"), dict):
+        d = resp["domain"]
+        if "autoRenew" in d:
+            d["autoRenew"] = _normalize_auto_renew(d["autoRenew"])
     _emit(resp, args.json)
     return 0
 
@@ -1285,6 +1318,10 @@ def cmd_nameservers(args: argparse.Namespace) -> int:
     resp = _request(creds, "POST", f"/domain/updateNs/{args.domain}",
                     body=body, idempotency_key=idem_key)
     print(f"Nameservers for {args.domain} updated: {ns_list}")
+    if isinstance(resp, dict) and (resp.get("message") or "").strip().lower().startswith("no change"):
+        print("NOTE: Porkbun reports \"No change\". Its /domain/updateNs endpoint is set-based — "
+              "the registry ignores NS order, so reordering the same nameservers is a no-op. "
+              "Supply a different NS set to actually change resolution.")
     _emit(resp, args.json)
     return 0
 
@@ -1304,6 +1341,11 @@ def cmd_dns_add(args: argparse.Namespace) -> int:
         raise CtlError(f"Invalid DNS record type: {args.type!r}")
     if not args.yes:
         raise CtlError("Refusing to add DNS record without --yes.")
+    if args.prio is not None and args.type not in _PRIO_RECORD_TYPES:
+        raise CtlError(
+            f"--prio is only meaningful for {'/'.join(_PRIO_RECORD_TYPES)} records, not {args.type}. "
+            "Omit --prio (Porkbun will set prio=0 by default for non-priority record types)."
+        )
     sub = args.subdomain or ""
     _validate_subdomain_label(sub)
     body: dict[str, Any] = {
@@ -1347,6 +1389,11 @@ def cmd_dns_edit(args: argparse.Namespace) -> int:
         )
     if not DNS_TYPE_RE.match(args.type):
         raise CtlError(f"Invalid DNS record type: {args.type!r}")
+    if args.prio is not None and args.type not in _PRIO_RECORD_TYPES:
+        raise CtlError(
+            f"--prio is only meaningful for {'/'.join(_PRIO_RECORD_TYPES)} records, not {args.type}. "
+            "Omit --prio (Porkbun will set prio=0 by default for non-priority record types)."
+        )
     sub = args.subdomain or ""
     _validate_subdomain_label(sub)
     body: dict[str, Any] = {
@@ -1586,13 +1633,24 @@ def _add_mut(p: argparse.ArgumentParser) -> None:
     p.add_argument("--dry-run", action="store_true", help="Print what would be sent; do not call API.")
 
 
+def _global_parent() -> argparse.ArgumentParser:
+    """Parent parser holding flags that should be accepted both before AND after
+    the subcommand (e.g. `... --json domain foo.com` and `... domain foo.com --json`).
+    """
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--json", action="store_true", default=False,
+                        help="Emit JSON output where applicable.")
+    return common
+
+
 def build_parser() -> argparse.ArgumentParser:
+    common = _global_parent()
     p = argparse.ArgumentParser(
         prog="porkbun-api-skill",
         description=f"porkbun-api-skill {VERSION} — safe CLI for the Porkbun v3 API.",
         epilog="Run `porkbun-api-skill <subcmd> --help` for per-command flags.",
+        parents=[common],
     )
-    p.add_argument("--json", action="store_true", help="Emit JSON output where applicable.")
     p.add_argument("--version", action="version",
                    version=f"porkbun-api-skill {VERSION} (AI-authored by Claude — see AUTHORS.md)")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -1600,6 +1658,7 @@ def build_parser() -> argparse.ArgumentParser:
     # ---- meta
     p_setup = sub.add_parser(
         "setup",
+        parents=[common],
         help="Add or replace the credential pair (terminal, interactive). Requires a TTY — AI agents cannot run this.",
     )
     p_setup.add_argument("--file", action="store_true",
@@ -1610,41 +1669,49 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_gui = sub.add_parser(
         "gui-setup",
+        parents=[common],
         help="Add or replace credentials via a native desktop dialog. AI-runnable: AI never sees the keys.",
     )
     p_gui.add_argument("--file", action="store_true")
     p_gui.add_argument("--replace", action="store_true")
     p_gui.set_defaults(func=cmd_gui_setup)
 
-    p_un = sub.add_parser("uninstall-credentials", help="Remove the stored credential pair.")
+    p_un = sub.add_parser("uninstall-credentials", parents=[common],
+                          help="Remove the stored credential pair.")
     p_un.add_argument("--yes", action="store_true")
     p_un.set_defaults(func=cmd_uninstall_credentials)
 
-    sub.add_parser("whoami", help="Verify auth via /ping; print credentialsValid + caller IP.").set_defaults(func=cmd_whoami)
+    sub.add_parser("whoami", parents=[common],
+                   help="Verify auth via /ping; print credentialsValid + caller IP."
+                   ).set_defaults(func=cmd_whoami)
 
-    sub.add_parser("balance", help="Show account credit (/account/balance).").set_defaults(func=cmd_balance)
+    sub.add_parser("balance", parents=[common],
+                   help="Show account credit (/account/balance).").set_defaults(func=cmd_balance)
 
-    p_cls = sub.add_parser("classify", help="Show how a method+path would be classified.")
+    p_cls = sub.add_parser("classify", parents=[common],
+                           help="Show how a method+path would be classified.")
     p_cls.add_argument("method")
     p_cls.add_argument("path")
     p_cls.set_defaults(func=cmd_classify)
 
     # ---- domains
-    p_doms = sub.add_parser("domains", help="List all domains (paginated).")
+    p_doms = sub.add_parser("domains", parents=[common], help="List all domains (paginated).")
     p_doms.add_argument("--expiring-within-days", type=int)
     p_doms.add_argument("--name-contains")
     p_doms.add_argument("--tlds", action="append", help="Limit to these TLDs (repeatable). e.g. --tlds com --tlds io")
     p_doms.set_defaults(func=cmd_domains)
 
-    p_dom = sub.add_parser("domain", help="Show one domain (/domain/get/{domain}).")
+    p_dom = sub.add_parser("domain", parents=[common], help="Show one domain (/domain/get/{domain}).")
     p_dom.add_argument("domain")
     p_dom.set_defaults(func=cmd_domain)
 
-    p_price = sub.add_parser("price", help="Check availability + price (/domain/checkDomain/{domain}).")
+    p_price = sub.add_parser("price", parents=[common],
+                             help="Check availability + price (/domain/checkDomain/{domain}).")
     p_price.add_argument("domain")
     p_price.set_defaults(func=cmd_price)
 
-    p_reg = sub.add_parser("register", help="Register a new domain. BILLABLE — charges account credit.")
+    p_reg = sub.add_parser("register", parents=[common],
+                           help="Register a new domain. BILLABLE — charges account credit.")
     p_reg.add_argument("domain")
     p_reg.add_argument("--cost-cents", type=int, required=False,
                        help="Cost in pennies; must match Porkbun's current /domain/checkDomain quote.")
@@ -1653,7 +1720,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_mut(p_reg)
     p_reg.set_defaults(func=cmd_register)
 
-    p_ren = sub.add_parser("renew", help="Renew a domain. BILLABLE.")
+    p_ren = sub.add_parser("renew", parents=[common], help="Renew a domain. BILLABLE.")
     p_ren.add_argument("domain")
     p_ren.add_argument("--cost-cents", type=int, required=False)
     p_ren.add_argument("--years", type=int)
@@ -1662,7 +1729,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_mut(p_ren)
     p_ren.set_defaults(func=cmd_renew)
 
-    p_tr = sub.add_parser("transfer", help="Inbound transfer of a domain. BILLABLE.")
+    p_tr = sub.add_parser("transfer", parents=[common], help="Inbound transfer of a domain. BILLABLE.")
     p_tr.add_argument("domain")
     p_tr.add_argument("--cost-cents", type=int, required=False)
     p_tr.add_argument("--auth-code", help="EPP auth code from the losing registrar.")
@@ -1671,40 +1738,46 @@ def build_parser() -> argparse.ArgumentParser:
     _add_mut(p_tr)
     p_tr.set_defaults(func=cmd_transfer)
 
-    p_ar = sub.add_parser("auto-renew", help="Toggle auto-renew on/off.")
+    p_ar = sub.add_parser("auto-renew", parents=[common], help="Toggle auto-renew on/off.")
     p_ar.add_argument("domain")
     p_ar.add_argument("--on", action="store_true")
     p_ar.add_argument("--off", action="store_true")
     _add_mut(p_ar)
     p_ar.set_defaults(func=cmd_auto_renew)
 
-    p_ns = sub.add_parser("nameservers", help="Get or set nameservers.")
+    p_ns = sub.add_parser("nameservers", parents=[common], help="Get or set nameservers.")
     p_ns.add_argument("domain")
     p_ns.add_argument("--get", action="store_true")
-    p_ns.add_argument("--set", help="Comma-separated NS list, e.g. ns1.example.com,ns2.example.com")
+    p_ns.add_argument(
+        "--set",
+        help="Comma-separated NS list, e.g. ns1.example.com,ns2.example.com. "
+             "NOTE: Porkbun's /domain/updateNs is set-based — the registry ignores order, "
+             "so passing the same NSes in a different order is a no-op (response will report \"No change\").",
+    )
     _add_mut(p_ns)
     p_ns.set_defaults(func=cmd_nameservers)
 
     # ---- DNS
-    p_dns = sub.add_parser("dns", help="DNS record operations.")
+    p_dns = sub.add_parser("dns", parents=[common], help="DNS record operations.")
     p_dns_sub = p_dns.add_subparsers(dest="dns_cmd", required=True)
 
-    p_dl = p_dns_sub.add_parser("list", help="List DNS records.")
+    p_dl = p_dns_sub.add_parser("list", parents=[common], help="List DNS records.")
     p_dl.add_argument("domain")
     p_dl.set_defaults(func=cmd_dns_list)
 
-    p_da = p_dns_sub.add_parser("add", help="Create a DNS record.")
+    p_da = p_dns_sub.add_parser("add", parents=[common], help="Create a DNS record.")
     p_da.add_argument("domain")
     p_da.add_argument("--type", required=True)
     p_da.add_argument("--content", required=True)
     p_da.add_argument("--subdomain", default="", help="Subdomain part only (no domain). Blank = root.")
     p_da.add_argument("--ttl", type=int)
-    p_da.add_argument("--prio", type=int)
+    p_da.add_argument("--prio", type=int,
+                      help="Priority (MX and SRV records only). Refused with an error on other types.")
     p_da.add_argument("--notes")
     _add_mut(p_da)
     p_da.set_defaults(func=cmd_dns_add)
 
-    p_de = p_dns_sub.add_parser("edit", help="Edit a DNS record by id.")
+    p_de = p_dns_sub.add_parser("edit", parents=[common], help="Edit a DNS record by id.")
     p_de.add_argument("domain")
     p_de.add_argument("--id", required=True)
     p_de.add_argument("--confirm-id", required=False,
@@ -1713,12 +1786,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_de.add_argument("--content", required=True)
     p_de.add_argument("--subdomain", default="")
     p_de.add_argument("--ttl", type=int)
-    p_de.add_argument("--prio", type=int)
+    p_de.add_argument("--prio", type=int,
+                      help="Priority (MX and SRV records only). Refused with an error on other types.")
     p_de.add_argument("--notes")
     _add_mut(p_de)
     p_de.set_defaults(func=cmd_dns_edit)
 
-    p_dd = p_dns_sub.add_parser("delete", help="Delete a DNS record by id.")
+    p_dd = p_dns_sub.add_parser("delete", parents=[common], help="Delete a DNS record by id.")
     p_dd.add_argument("domain")
     p_dd.add_argument("--id", required=True)
     p_dd.add_argument("--confirm-id", required=False, help="Must equal --id.")
@@ -1726,20 +1800,22 @@ def build_parser() -> argparse.ArgumentParser:
     p_dd.set_defaults(func=cmd_dns_delete)
 
     # ---- SSL
-    p_ssl = sub.add_parser("ssl", help="Retrieve SSL bundle. PRIVILEGE — response contains private key.")
+    p_ssl = sub.add_parser("ssl", parents=[common],
+                           help="Retrieve SSL bundle. PRIVILEGE — response contains private key.")
     p_ssl.add_argument("domain")
     p_ssl.add_argument("--allow-privilege", action="store_true")
     _add_mut(p_ssl)
     p_ssl.set_defaults(func=cmd_ssl)
 
     # ---- audit
-    p_aud = sub.add_parser("audit-log", help="Print local audit log of mutations.")
+    p_aud = sub.add_parser("audit-log", parents=[common], help="Print local audit log of mutations.")
     p_aud.add_argument("--last", type=int)
     p_aud.set_defaults(func=cmd_audit_log)
 
     # ---- generic api
     p_api = sub.add_parser(
         "api",
+        parents=[common],
         help="Generic API call: porkbun-api-skill api <METHOD> <path> [flags]. "
              "Safety classifier enforces required flags.",
     )

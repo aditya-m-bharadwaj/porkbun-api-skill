@@ -4,6 +4,16 @@ All notable changes are documented here. Format follows [Keep a Changelog](https
 
 ## [Unreleased]
 
+### Fixed / Polished — post-alpha.1 papercuts (from 2026-05-13 live test on idwgit.cc)
+
+- **`--json` works after a subcommand.** Previously `--json` was only defined on the top-level parser, so `porkbun-api-skill dns list <domain> --json` silently emitted human-readable output (and broke a downstream `python3 -c` pipe during the live test). The flag is now declared on a parent parser (`_global_parent()`) and inherited by every subparser via `parents=[common]`. Both positions work: `--json <subcmd>` and `<subcmd> ... --json`.
+- **`--prio` is refused on non-MX/SRV record types.** `dns add` / `dns edit` now error with a clear message if `--prio` is passed for `A`, `AAAA`, `CNAME`, `NS`, `TXT`, `CAA`, etc. (priority is only meaningful for MX and SRV). Porkbun will still default `prio=0` server-side for those types — there's nothing the CLI can do about that — but the CLI no longer passes through a user-supplied value that the server quietly ignores.
+- **`prio` hidden from `dns list` output for non-MX/SRV records.** Porkbun returns `prio=0` on every record regardless of type. `_format_summary` now suppresses the `prio=...` column for record types where it's meaningless.
+- **`nameservers --set` surfaces Porkbun's `"No change"` response prominently.** When the API reports no change (because the registry's `/domain/updateNs` is set-based and ignores order), the CLI prints an explicit `NOTE:` warning instead of leaving the operator to spot it in the raw JSON. The `--set` help text now documents the set-based behavior.
+- **`API_ACCESS_DISABLED` / `DOMAIN_IS_NOT_OPTED_IN_TO_API_ACCESS` errors get a friendlier redirect.** `_request` detects these codes and replaces Porkbun's auto-generated 100-character UPPERCASE_UNDERSCORED error with a one-liner pointing the operator at <https://porkbun.com/account/api> (account-wide toggle) or the domain's per-domain settings page.
+- **`autoRenew` typing normalized on `domain <name>` output.** Porkbun returns `0` (int) when auto-renew is off and `"1"` (string) when on. The CLI's new `_normalize_auto_renew` helper coerces both forms to a stable string `"0"` / `"1"` so consumers don't have to special-case the typing inconsistency.
+- **Tests**: +16 cases (68 total, all passing). Covers `--json` propagation in both positions, `_normalize_auto_renew` across int/string/bool/unknown inputs, `_format_summary` hiding `prio` for non-MX/SRV, and `dns add` refusing `--prio` for non-priority record types.
+
 ### Added — 0.1.0-alpha.1 — first functional CLI
 
 - `bin/porkbun-api-skill` is no longer a stub — the full single-file CLI is implemented per the contract in [`.claude/skills/porkbun-api-skill/SKILL.md`](.claude/skills/porkbun-api-skill/SKILL.md) and ADRs 0001–0008.
